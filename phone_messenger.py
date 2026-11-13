@@ -140,13 +140,13 @@ class SmsManagerApp:
         ttk.Button(thread_box, text="+ 신규 번호로 메시지", command=self.new_conversation).pack(fill="x", pady=(0, 6))
         thread_list = ttk.Frame(thread_box)
         thread_list.pack(fill="both", expand=True)
-        self.thread_tree = ttk.Treeview(thread_list, columns=("preview", "phone"), show="tree headings", selectmode="browse")
+        self.thread_tree = ttk.Treeview(thread_list, columns=("phone", "preview"), show="tree headings", selectmode="browse")
         self.thread_tree.heading("#0", text="번호")
-        self.thread_tree.heading("preview", text="최근 내용")
         self.thread_tree.heading("phone", text="스마트폰")
-        self.thread_tree.column("#0", width=120, stretch=False)
+        self.thread_tree.heading("preview", text="최근 내용")
+        self.thread_tree.column("#0", width=118, stretch=False)
+        self.thread_tree.column("phone", width=74, anchor="center", stretch=False)
         self.thread_tree.column("preview", width=150, stretch=True)
-        self.thread_tree.column("phone", width=72, anchor="center", stretch=False)
         thread_scroll = ttk.Scrollbar(thread_list, orient="vertical", command=self.thread_tree.yview)
         self.thread_tree.configure(yscrollcommand=thread_scroll.set)
         self.thread_tree.pack(side="left", fill="both", expand=True)
@@ -511,9 +511,9 @@ class SmsManagerApp:
                 preview = matched[-1]
             unread = self.unread_for(self.active_serial, address)
             label = f"{address}  +{unread}" if unread else address
-            self.thread_tree.insert("", "end", iid=address, text=label, values=(preview.replace("\n", " ")[:35], "열기"))
+            self.thread_tree.insert("", "end", iid=address, text=label, values=("열기", preview.replace("\n", " ")[:35]))
         if selected_norm and selected_norm not in groups and (not query or query in selected_norm.lower()):
-            self.thread_tree.insert("", 0, iid=selected_norm, text=selected_norm, values=("[새 메시지]", "열기"))
+            self.thread_tree.insert("", 0, iid=selected_norm, text=selected_norm, values=("열기", "[새 메시지]"))
         if selected_norm and self.thread_tree.exists(selected_norm):
             self.thread_tree.selection_set(selected_norm)
         self.suppress_selection = False
@@ -553,7 +553,7 @@ class SmsManagerApp:
         self.render_chat()
 
     def on_thread_shortcut(self, event):
-        if self.thread_tree.identify_column(event.x) != "#2":
+        if self.thread_tree.identify_column(event.x) != "#1":
             return
         row = self.thread_tree.identify_row(event.y)
         if row:
