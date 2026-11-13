@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import io
 import json
 import mimetypes
@@ -12,6 +13,7 @@ import time
 import tkinter as tk
 import urllib.request
 import re
+import winsound
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
@@ -88,8 +90,16 @@ class SmsManagerApp:
         self.media_loading = set()
         self.status_hold_until = 0
         self.message_sync_running = False
+        self.fast_sync_running = False
+        self.message_lock = threading.Lock()
+        self.alert_ready = set()
+        self.alert_known = {}
+        self.fresh_marks = set()
+        self._arrival_popup = None
+        self._arrival_popup_after = None
         self.polling = False
         self.suppress_selection = False
+        self._suppress_token = 0
         self.status = tk.StringVar(value="휴대폰을 검색하는 중...")
         self.chat_title = tk.StringVar(value="대화를 선택하세요")
         self.attachment_text = tk.StringVar(value="첨부 이미지 없음")
@@ -102,6 +112,11 @@ class SmsManagerApp:
         self.update_check_running = False
         self.root.after(1500, lambda: self.check_updates(manual=False))
 
+    def _configure_tree_style(self, style_name):
+        style = ttk.Style(self.root)
+        style.configure(style_name, font=("맑은 고딕", 10), rowheight=32)
+        style.configure(f"{style_name}.Heading", font=("맑은 고딕", 9, "bold"))
+
     def _build(self):
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
@@ -112,8 +127,17 @@ class SmsManagerApp:
         ttk.Button(top, text="브리지 앱 설치/업데이트", command=self.install_bridge).pack(side="right", padx=(0, 6))
         ttk.Button(top, text="새로고침", command=self.refresh_devices).pack(side="right", padx=6)
 
-        panes = ttk.Panedwindow(outer, orient="horizontal")
-        panes.pack(fill="both", expand=True)
+        self.notice_bar = tk.Frame(outer, background="#C2410C", cursor="hand2")
+        self.notice_label = tk.Label(
+            self.notice_bar, text="", background="#C2410C", foreground="#FFFFFF",
+            font=("맑은 고딕", 13, "bold"), anchor="w", cursor="hand2", padx=14, pady=9,
+        )
+        self.notice_label.pack(fill="x")
+        self.notice_bar.bind("<Button-1>", lambda _event: self._open_newest_unread())
+        self.notice_label.bind("<Button-1>", lambda _event: self._open_newest_unread())
+        self.panes = ttk.Panedwindow(outer, orient="horizontal")
+        self.panes.pack(fill="both", expand=True)
+        panes = self.panes
         device_box = ttk.LabelFrame(panes, text="연결된 스마트폰", padding=6)
         thread_box = ttk.LabelFrame(panes, text="대화 목록", padding=6)
         chat_box = ttk.Frame(panes)
@@ -123,7 +147,11 @@ class SmsManagerApp:
 
         device_list = ttk.Frame(device_box)
         device_list.pack(fill="both", expand=True)
-        self.device_tree = ttk.Treeview(device_list, columns=("state",), show="tree", selectmode="browse")
+        self._configure_tree_style("Devices.Treeview")
+        self.device_tree = ttk.Treeview(
+            device_list, columns=("state",), show="tree", selectmode="browse", style="Devices.Treeview")
+        self.device_tree.tag_configure("unread", background="#FF9F1C", foreground="#1A1206", font=("맑은 고딕", 10, "bold"))
+        self.device_tree.tag_configure("read", background="#FFFFFF", foreground="#1A1A1A", font=("맑은 고딕", 10))
         device_scroll = ttk.Scrollbar(device_list, orient="vertical", command=self.device_tree.yview)
         self.device_tree.configure(yscrollcommand=device_scroll.set)
         self.device_tree.pack(side="left", fill="both", expand=True)
@@ -140,12 +168,17 @@ class SmsManagerApp:
         ttk.Button(thread_box, text="+ 신규 번호로 메시지", command=self.new_conversation).pack(fill="x", pady=(0, 6))
         thread_list = ttk.Frame(thread_box)
         thread_list.pack(fill="both", expand=True)
-        self.thread_tree = ttk.Treeview(thread_list, columns=("phone", "preview"), show="tree headings", selectmode="browse")
-        self.thread_tree.heading("#0", text="번호")
-        self.thread_tree.heading("phone", text="스마트폰")
+        self._configure_tree_style("Threads.Treeview")
+        self.thread_tree = ttk.Treeview(
+            thread_list, columns=("open", "number", "preview"), show="headings", selectmode="browse",
+            style="Threads.Treeview")
+        self.thread_tree.tag_configure("unread", background="#FF9F1C", foreground="#1A1206", font=("맑은 고딕", 11, "bold"))
+        self.thread_tree.tag_configure("read", background="#FFFFFF", foreground="#1A1A1A", font=("맑은 고딕", 10))
+        self.thread_tree.heading("open", text="스마트폰")
+        self.thread_tree.heading("number", text="번호")
         self.thread_tree.heading("preview", text="최근 내용")
-        self.thread_tree.column("#0", width=118, stretch=False)
-        self.thread_tree.column("phone", width=74, anchor="center", stretch=False)
+        self.thread_tree.column("open", width=74, anchor="center", stretch=False)
+        self.thread_tree.column("number", width=118, anchor="w", stretch=False)
         self.thread_tree.column("preview", width=150, stretch=True)
         thread_scroll = ttk.Scrollbar(thread_list, orient="vertical", command=self.thread_tree.yview)
         self.thread_tree.configure(yscrollcommand=thread_scroll.set)
@@ -234,7 +267,7 @@ class SmsManagerApp:
             return
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
-    def _refresh_worker(self):
+    def _refresh_worker(self, reload_messages=True):
         result = self.adb_run(None, "devices", "-l")
         found = []
         for line in result.stdout.splitlines()[1:]:
@@ -246,8 +279,11 @@ class SmsManagerApp:
             port = 18765 + i
             status = self.ensure_bridge(serial, port)
             devices[serial] = {"model": model, "port": port, "online": bool(status and status.get("ok"))}
-            if devices[serial]["online"]:
-                self.messages[serial] = self.collect_messages(serial, port)
+            if devices[serial]["online"] and (reload_messages or serial not in self.messages):
+                loaded = self.collect_messages(serial, port)
+                with self.message_lock:
+                    self.messages[serial] = loaded
+                    self._absorb_arrivals(serial, full_snapshot=True)
                 if serial not in self.config["initialized"]:
                     seen = self.config["seen"].setdefault(serial, {})
                     for message in self.messages[serial]:
@@ -372,27 +408,224 @@ class SmsManagerApp:
         return fields
 
     def poll_messages(self):
-        if self.devices and not self.message_sync_running:
+        if self.devices and not self.fast_sync_running:
+            self.fast_sync_running = True
+            threading.Thread(target=self._fast_sync, daemon=True).start()
+        if self.devices and not self.message_sync_running and time.time() >= getattr(self, "_full_sync_at", 0):
+            self._full_sync_at = time.time() + 30
             self.message_sync_running = True
             threading.Thread(target=self._sync_messages, daemon=True).start()
-        self.root.after(2000, self.poll_messages)
+        self.root.after(1000, self.poll_messages)
 
     def _sync_messages(self):
         try:
             changed = False
+            arrivals = []
             for serial, device in list(self.devices.items()):
                 if not device.get("online"):
                     continue
                 messages = self.collect_messages(serial, device["port"])
-                old_keys = [item.get("key") for item in self.messages.get(serial, [])]
-                new_keys = [item.get("key") for item in messages]
-                if old_keys != new_keys:
-                    self.messages[serial] = messages
-                    changed = True
-            if changed:
-                self.root.after(0, self.render_all)
+                with self.message_lock:
+                    if self._replace_messages(serial, messages):
+                        changed = True
+                    arrivals.extend(self._absorb_arrivals(serial, full_snapshot=True))
+            before = len(self.sent_notices)
+            self.sent_notices = [notice for notice in self.sent_notices if not self._notice_confirmed(notice)]
+            self._schedule_sync_result(changed or len(self.sent_notices) != before, arrivals)
         finally:
             self.message_sync_running = False
+
+    def _fast_sync(self):
+        try:
+            serials = [serial for serial, device in list(self.devices.items()) if device.get("online")]
+            jobs = []
+            for serial in serials:
+                existing = self.messages.get(serial, [])
+                jobs.append((serial, "sms", self._recent_since(existing, "sms:")))
+                jobs.append((serial, "im", self._recent_since(existing, "im:")))
+            if not jobs:
+                return
+            from concurrent.futures import ThreadPoolExecutor
+
+            def work(job):
+                serial, kind, since = job
+                if kind == "sms":
+                    query = f'content query --uri content://sms --projection _id:address:body:date:type --where "date>{since}"'
+                else:
+                    query = (
+                        "content query --uri content://im/chat "
+                        "--projection _id:address:body:date:type:content_type "
+                        f'--where "date>{since}"'
+                    )
+                result = self.adb_run(serial, "shell", query, timeout=12)
+                return serial, self._messages_from_query(result.stdout or "", kind)
+
+            changed = False
+            arrivals = []
+            with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+                for serial, rows in pool.map(work, jobs):
+                    with self.message_lock:
+                        if self._merge_messages(serial, rows):
+                            changed = True
+                        arrivals.extend(self._absorb_arrivals(serial, full_snapshot=False))
+            before = len(self.sent_notices)
+            self.sent_notices = [notice for notice in self.sent_notices if not self._notice_confirmed(notice)]
+            self._schedule_sync_result(changed or len(self.sent_notices) != before, arrivals)
+        finally:
+            self.fast_sync_running = False
+
+    def _recent_since(self, existing, prefix):
+        dates = [item["date"] for item in existing if str(item.get("key", "")).startswith(prefix)]
+        if dates:
+            return max(dates) - 2000
+        return int(time.time() * 1000) - 120000
+
+    def _content_rows(self, text):
+        current = ""
+        for line in text.splitlines():
+            if line.startswith("Row:"):
+                if current:
+                    yield current
+                current = line
+            elif current:
+                current += "\n" + line
+        if current:
+            yield current
+
+    def _messages_from_query(self, text, kind):
+        messages = []
+        for line in self._content_rows(text):
+            fields = self.parse_content_row(line)
+            message_type = fields.get("type")
+            if message_type not in {"1", "2"}:
+                continue
+            try:
+                date = int(fields.get("date") or 0)
+                message_id = int(fields.get("_id") or 0)
+            except ValueError:
+                continue
+            if message_id <= 0:
+                continue
+            body = fields.get("body") or ""
+            if body in {"", "NULL"}:
+                content_type = fields.get("content_type") or ""
+                body = "[이미지]" if content_type.startswith("image/") else ""
+            messages.append({
+                "key": f"{kind}:{message_id}",
+                "kind": kind,
+                "address": fields.get("address") or "",
+                "body": "" if body == "NULL" else body,
+                "date": date,
+                "incoming": message_type == "1",
+                "images": [],
+            })
+        return messages
+
+    def _merge_messages(self, serial, fresh):
+        current = self.messages.setdefault(serial, [])
+        known = {item.get("key") for item in current}
+        added = [item for item in fresh if item.get("key") not in known]
+        if not added:
+            return False
+        current.extend(added)
+        current.sort(key=lambda item: item.get("date") or 0)
+        return True
+
+    def _replace_messages(self, serial, messages):
+        newest = max((item["date"] for item in messages), default=0)
+        incoming_keys = {item.get("key") for item in messages}
+        kept = [
+            item for item in self.messages.get(serial, [])
+            if item.get("key") not in incoming_keys and item["date"] >= newest - 5000
+        ]
+        merged = messages + kept
+        merged.sort(key=lambda item: item.get("date") or 0)
+        old_keys = [item.get("key") for item in self.messages.get(serial, [])]
+        self.messages[serial] = merged
+        return old_keys != [item.get("key") for item in merged]
+
+    def _mark_open_thread_seen(self):
+        serial, address = self.active_serial, self.active_address
+        if not serial or not address:
+            return
+        dates = [
+            item["date"] for item in self.messages.get(serial, [])
+            if item.get("incoming") and same_phone(item.get("address"), address)
+        ]
+        if not dates:
+            return
+        seen = self.config["seen"].setdefault(serial, {})
+        norm = normalize_phone(address)
+        latest = max(dates)
+        if latest > seen.get(norm, 0):
+            seen[norm] = latest
+            self.save_config()
+
+    def _absorb_arrivals(self, serial, full_snapshot):
+        current = [
+            item for item in self.messages.get(serial, [])
+            if item.get("incoming") and item.get("key")
+        ]
+        keys = {item["key"] for item in current}
+        if serial not in self.alert_ready:
+            if full_snapshot:
+                self.alert_ready.add(serial)
+                self.alert_known[serial] = keys
+            return []
+        known = self.alert_known.setdefault(serial, set())
+        fresh = [item for item in current if item["key"] not in known]
+        known.update(keys)
+        if full_snapshot:
+            cutoff = int(time.time() * 1000) - 180000
+            fresh = [item for item in fresh if (item.get("date") or 0) >= cutoff]
+        arrivals = []
+        for item in fresh:
+            address = normalize_phone(item.get("address")) or "알 수 없음"
+            self.fresh_marks.add((serial, address, item["key"]))
+            arrivals.append({
+                "serial": serial,
+                "key": item["key"],
+                "address": item.get("address") or address,
+                "body": item.get("body") or "",
+                "date": item.get("date") or 0,
+                "images": bool(item.get("images")),
+            })
+        arrivals.sort(key=lambda item: item["date"], reverse=True)
+        return arrivals
+
+    def _schedule_sync_result(self, changed, arrivals):
+        unique = []
+        seen = set()
+        for item in arrivals:
+            token = (item.get("serial"), item.get("key"))
+            if token in seen:
+                continue
+            seen.add(token)
+            unique.append(item)
+
+        def apply():
+            if self._app_is_active():
+                self._mark_open_thread_seen()
+            if changed or unique:
+                self.render_all()
+            else:
+                self._refresh_notice_bar()
+            if unique:
+                self._announce_arrivals(unique)
+
+        self.root.after(0, apply)
+
+    def _app_is_active(self):
+        try:
+            if str(self.root.state()) == "iconic":
+                return False
+            return bool(self.root.focus_displayof())
+        except tk.TclError:
+            return False
+
+    def _phone_name(self, serial):
+        device = self.devices.get(serial) or {}
+        return self.config["names"].get(serial, device.get("model") or serial)
 
     def render_all(self):
         self.render_devices()
@@ -400,6 +633,7 @@ class SmsManagerApp:
             self.render_threads()
             if self.active_address:
                 self.render_chat()
+        self._refresh_notice_bar()
 
     def unread_for(self, serial, address=None):
         seen_map = self.config["seen"].get(serial, {})
@@ -418,21 +652,29 @@ class SmsManagerApp:
     def render_devices(self):
         selected = self.active_serial
         self.suppress_selection = True
+        self._suppress_token += 1
+        token = self._suppress_token
         self.device_tree.delete(*self.device_tree.get_children())
         self.device_rows.clear()
         for serial, d in self.devices.items():
             name = self.config["names"].get(serial, d["model"])
             unread = self.unread_for(serial)
-            suffix = f"  +{unread}" if unread else ""
             state = "연결됨" if d["online"] else "브리지 실행 필요"
-            self.device_rows[serial] = self.device_tree.insert("", "end", iid=serial, text=f"{name}{suffix}", values=(state,))
+            if unread:
+                label = f"● {name}    새 메시지 {unread}건"
+                tags = ("unread",)
+            else:
+                label = name
+                tags = ("read",)
+            self.device_rows[serial] = self.device_tree.insert(
+                "", "end", iid=serial, text=label, values=(state,), tags=tags)
         if selected in self.devices:
             self.device_tree.selection_set(selected)
         elif self.devices:
             first = next(iter(self.devices))
             self.device_tree.selection_set(first)
             self.select_device(first)
-        self.suppress_selection = False
+        self.root.after_idle(lambda token=token: self._release_selection_suppress(token))
 
     def ensure_bridge(self, serial, port):
         self.adb_run(serial, "forward", f"tcp:{port}", "tcp:8765")
@@ -485,7 +727,10 @@ class SmsManagerApp:
         status = self.ensure_bridge(serial, device["port"])
         device["online"] = bool(status and status.get("ok"))
         if device["online"]:
-            self.messages[serial] = self.collect_messages(serial, device["port"])
+            loaded = self.collect_messages(serial, device["port"])
+            with self.message_lock:
+                self.messages[serial] = loaded
+                self._absorb_arrivals(serial, full_snapshot=True)
             self.root.after(0, self.render_all)
             self.set_status(f"{device['model']} 연결됨")
         else:
@@ -495,28 +740,57 @@ class SmsManagerApp:
         selected = self.active_address
         query = self.thread_search.get().strip().lower()
         self.suppress_selection = True
+        self._suppress_token += 1
+        token = self._suppress_token
         self.thread_tree.delete(*self.thread_tree.get_children())
         groups = defaultdict(list)
-        for m in self.messages.get(self.active_serial, []):
-            groups[normalize_phone(m.get("address")) or "알 수 없음"].append(m)
+        seen_map = self.config["seen"].get(self.active_serial, {})
+        unread_counts = defaultdict(int)
+        for message in self.messages.get(self.active_serial, []):
+            norm = normalize_phone(message.get("address")) or "알 수 없음"
+            groups[norm].append(message)
+            if not message.get("incoming"):
+                continue
+            seen_at = seen_map.get(norm, seen_map.get(message.get("address"), 0))
+            if message["date"] > seen_at:
+                unread_counts[norm] += 1
         selected_norm = normalize_phone(selected) if selected else ""
-        for address, items in sorted(groups.items(), key=lambda x: x[1][-1]["date"], reverse=True):
+        ranked = sorted(
+            groups.items(),
+            key=lambda item: (0 if unread_counts[item[0]] else 1, -item[1][-1]["date"]),
+        )
+        for address, items in ranked:
             searchable = address + "\n" + "\n".join((item.get("body") or "") for item in items)
             if query and query not in searchable.lower():
                 continue
             latest = items[-1]
             preview = latest.get("body") or ("[이미지]" if latest.get("images") else "")
-            matched = [notice.get("label", "이미지 전송됨") for notice in self.sent_notices if same_phone(notice["address"], address)]
-            if matched:
-                preview = matched[-1]
-            unread = self.unread_for(self.active_serial, address)
-            label = f"{address}  +{unread}" if unread else address
-            self.thread_tree.insert("", "end", iid=address, text=label, values=("열기", preview.replace("\n", " ")[:35]))
+            pending = [
+                notice for notice in self.sent_notices
+                if same_phone(notice["address"], address) and not self._notice_confirmed(notice)
+            ]
+            if pending:
+                preview = pending[-1].get("text") or pending[-1].get("label") or preview
+            unread = unread_counts[address]
+            preview_text = preview.replace("\n", " ")
+            if unread:
+                label = f"● {address}    새 {unread}건"
+                preview_text = f"새 메시지  {preview_text[:48]}"
+                tags = ("unread",)
+            else:
+                label = address
+                preview_text = preview_text[:35]
+                tags = ("read",)
+            self.thread_tree.insert("", "end", iid=address, values=("열기", label, preview_text), tags=tags)
         if selected_norm and selected_norm not in groups and (not query or query in selected_norm.lower()):
-            self.thread_tree.insert("", 0, iid=selected_norm, text=selected_norm, values=("열기", "[새 메시지]"))
+            self.thread_tree.insert("", 0, iid=selected_norm, values=("열기", selected_norm, "[새 메시지]"))
         if selected_norm and self.thread_tree.exists(selected_norm):
             self.thread_tree.selection_set(selected_norm)
-        self.suppress_selection = False
+        self.root.after_idle(lambda token=token: self._release_selection_suppress(token))
+
+    def _release_selection_suppress(self, token):
+        if token == self._suppress_token:
+            self.suppress_selection = False
 
     def new_conversation(self):
         if not self.active_serial or not self.devices.get(self.active_serial, {}).get("online"):
@@ -539,18 +813,24 @@ class SmsManagerApp:
         self.compose.focus_set()
 
     def on_thread_select(self, _event=None):
-        if self.suppress_selection:
+        if self.suppress_selection or getattr(self, "_opening_thread", False):
             return
         selected = self.thread_tree.selection()
         if not selected:
             return
-        self.active_address = selected[0]
-        items = [m for m in self.messages.get(self.active_serial, []) if same_phone(m.get("address"), self.active_address)]
-        if items:
-            self.config["seen"].setdefault(self.active_serial, {})[normalize_phone(self.active_address)] = max(m["date"] for m in items)
-            self.save_config()
-        self.update_unread_labels()
-        self.render_chat()
+        self._opening_thread = True
+        try:
+            self.active_address = selected[0]
+            items = [m for m in self.messages.get(self.active_serial, []) if same_phone(m.get("address"), self.active_address)]
+            if items:
+                self.config["seen"].setdefault(self.active_serial, {})[normalize_phone(self.active_address)] = max(m["date"] for m in items)
+                self.save_config()
+            norm = normalize_phone(self.active_address)
+            self.fresh_marks = {mark for mark in self.fresh_marks if not (mark[0] == self.active_serial and mark[1] == norm)}
+            self.update_unread_labels()
+            self.render_chat()
+        finally:
+            self._opening_thread = False
 
     def on_thread_shortcut(self, event):
         if self.thread_tree.identify_column(event.x) != "#1":
@@ -558,6 +838,58 @@ class SmsManagerApp:
         row = self.thread_tree.identify_row(event.y)
         if row:
             self.open_phone_conversation(row)
+
+    def _phone_lock_state(self, serial):
+        result = self.adb_run(
+            serial, "shell",
+            "dumpsys power | grep -m 1 mWakefulness=; dumpsys window | grep -m 1 isKeyguardShowing=",
+            timeout=8,
+        )
+        text = result.stdout or ""
+        wake = re.search(r"mWakefulness=(\w+)", text)
+        guard = re.search(r"isKeyguardShowing=(true|false)", text)
+        asleep = not wake or wake.group(1) != "Awake"
+        locked = bool(guard and guard.group(1) == "true")
+        return asleep, locked
+
+    def _display_size(self, serial):
+        result = self.adb_run(serial, "shell", "wm", "size", timeout=8)
+        found = None
+        for line in (result.stdout or "").splitlines():
+            if "size:" not in line or "x" not in line:
+                continue
+            part = line.split(":", 1)[-1].strip()
+            width, height = part.split("x", 1)
+            if width.isdigit() and height.isdigit():
+                found = (int(width), int(height))
+                if line.strip().startswith("Override"):
+                    return found
+        return found or (1080, 2400)
+
+    def _wake_for_open(self, serial):
+        asleep, locked = self._phone_lock_state(serial)
+        if not asleep and not locked:
+            return False
+        if asleep:
+            self.adb_run(serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP", timeout=8)
+            time.sleep(0.45)
+        self.adb_run(serial, "shell", "wm", "dismiss-keyguard", timeout=8)
+        time.sleep(0.25)
+        _, locked = self._phone_lock_state(serial)
+        if locked:
+            self.adb_run(serial, "shell", "input", "keyevent", "82", timeout=8)
+            time.sleep(0.2)
+            _, locked = self._phone_lock_state(serial)
+        if locked:
+            width, height = self._display_size(serial)
+            x = str(width // 2)
+            self.adb_run(
+                serial, "shell", "input", "swipe",
+                x, str(int(height * 0.78)), x, str(int(height * 0.28)), "180",
+                timeout=8,
+            )
+            time.sleep(0.25)
+        return True
 
     def open_phone_conversation(self, address):
         serial = self.active_serial
@@ -567,6 +899,7 @@ class SmsManagerApp:
             return
 
         def work():
+            woke = self._wake_for_open(serial)
             result = self.adb_run(
                 serial, "shell", "am", "start",
                 "-a", "android.intent.action.VIEW",
@@ -589,10 +922,31 @@ class SmsManagerApp:
             if self.device_tree.exists(serial):
                 name = self.config["names"].get(serial, self.devices[serial]["model"])
                 unread = self.unread_for(serial)
-                self.device_tree.item(serial, text=f"{name}  +{unread}" if unread else name)
+                if unread:
+                    label = f"● {name}    새 메시지 {unread}건"
+                    tags = ("unread",)
+                else:
+                    label = name
+                    tags = ("read",)
+                self.device_tree.item(serial, text=label, tags=tags)
         for address in self.thread_tree.get_children():
             unread = self.unread_for(self.active_serial, address)
-            self.thread_tree.item(address, text=f"{address}  +{unread}" if unread else address)
+            values = list(self.thread_tree.item(address, "values"))
+            if len(values) >= 3:
+                if unread:
+                    values[1] = f"● {address}    새 {unread}건"
+                    preview = values[2]
+                    if not str(preview).startswith("새 메시지"):
+                        values[2] = f"새 메시지  {preview}"
+                    tags = ("unread",)
+                else:
+                    values[1] = address
+                    preview = str(values[2])
+                    if preview.startswith("새 메시지"):
+                        values[2] = preview.replace("새 메시지  ", "", 1).strip()
+                    tags = ("read",)
+                self.thread_tree.item(address, values=values, tags=tags)
+        self._refresh_notice_bar()
 
     def _sync_chat_scroll(self, _event=None):
         self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all") or (0, 0, 0, 0))
@@ -619,17 +973,24 @@ class SmsManagerApp:
         serial, address = self.active_serial, self.active_address
         if not serial or not address:
             return
-        self.chat_title.set(f"{address}  ·  {self.config['names'].get(serial, self.devices[serial]['model'])}")
+        unread = self.unread_for(serial, address)
+        title = f"{address}  ·  {self.config['names'].get(serial, self.devices[serial]['model'])}"
+        if unread:
+            title = f"● 새 메시지 {unread}건  ·  {title}"
+        self.chat_title.set(title)
         items = [m for m in self.messages.get(serial, []) if same_phone(m.get("address"), address) and not self._shown_as_notice(serial, m)]
         for notice in self.sent_notices:
-            if notice["serial"] == serial and same_phone(notice["address"], address):
-                items.append({
-                    "incoming": False,
-                    "date": int(notice["at"] * 1000),
-                    "body": notice.get("text") or "",
-                    "local_image": notice.get("image"),
-                    "sent_label": notice.get("label", "이미지 전송됨"),
-                })
+            if notice["serial"] != serial or not same_phone(notice["address"], address) or self._notice_confirmed(notice):
+                continue
+            label = notice.get("label") or ""
+            show_label = bool(notice.get("image")) or label not in {"전송됨", "이미지 전송됨"}
+            items.append({
+                "incoming": False,
+                "date": int(notice["at"] * 1000),
+                "body": notice.get("text") or "",
+                "local_image": notice.get("image"),
+                "sent_label": label if show_label else "",
+            })
         items.sort(key=lambda item: item["date"])
         thread_key = (serial, normalize_phone(address))
         same_thread = getattr(self, "_rendered_address", None) == thread_key
@@ -668,22 +1029,31 @@ class SmsManagerApp:
     def _add_message_bubble(self, message, serial, clock, wrap):
         incoming = bool(message.get("incoming"))
         failed = message.get("sent_label") == "전송 실패"
-        bubble_bg = BUBBLE_IN if incoming else (BUBBLE_FAIL if failed else BUBBLE_OUT)
+        fresh = incoming and (
+            serial, normalize_phone(message.get("address")), message.get("key")
+        ) in self.fresh_marks
+        bubble_bg = "#FFF4E5" if fresh else (BUBBLE_IN if incoming else (BUBBLE_FAIL if failed else BUBBLE_OUT))
         text_color = TEXT_IN if incoming else TEXT_OUT
-        hint_color = "#5C6B7A" if incoming else "#D6E4FF"
-        who = "상대 · 받음" if incoming else "나 · 보냄"
-        who_color = META_IN if incoming else META_OUT
+        hint_color = "#9A3412" if fresh else ("#5C6B7A" if incoming else "#D6E4FF")
+        who = "새 메시지 · 받음" if fresh else ("상대 · 받음" if incoming else "나 · 보냄")
+        who_color = "#C2410C" if fresh else (META_IN if incoming else META_OUT)
         row = tk.Frame(self.chat_inner, background=CHAT_BG)
         row.pack(fill="x", padx=12, pady=3)
         holder = tk.Frame(row, background=CHAT_BG)
         holder.pack(side="left" if incoming else "right", anchor="w" if incoming else "e")
+        if fresh:
+            tk.Label(
+                holder, text="방금 도착", background="#C2410C", foreground="#FFFFFF",
+                font=("맑은 고딕", 8, "bold"), padx=6, pady=1,
+            ).pack(anchor="w", padx=4, pady=(0, 2))
         tk.Label(
             holder, text=f"{who}   {clock}", background=CHAT_BG, foreground=who_color,
             font=("맑은 고딕", 8, "bold"),
         ).pack(anchor="w" if incoming else "e", padx=4)
         bubble = tk.Frame(
             holder, background=bubble_bg, padx=10, pady=8,
-            highlightthickness=1 if incoming else 0, highlightbackground="#C5D0DC",
+            highlightthickness=3 if fresh else (1 if incoming else 0),
+            highlightbackground="#C2410C" if fresh else "#C5D0DC",
         )
         bubble.pack(anchor="w" if incoming else "e")
         body = (message.get("body") or "").strip()
@@ -935,19 +1305,19 @@ class SmsManagerApp:
         text = self.compose.get("1.0", "end").strip()
         if not text and not self.attachment:
             return "break"
-        notice = None
-        if self.attachment:
-            notice = {
-                "serial": self.active_serial,
-                "address": self.active_address,
-                "image": self.attachment.read_bytes(),
-                "text": text,
-                "at": time.time(),
-                "label": "전송 중",
-            }
-            self.sent_notices.append(notice)
-            self.render_chat()
-            self.set_status("이미지를 전송하는 중...")
+        notice = {
+            "serial": self.active_serial,
+            "address": self.active_address,
+            "image": self.attachment.read_bytes() if self.attachment else None,
+            "text": text,
+            "at": time.time(),
+            "label": "전송 중",
+        }
+        self.sent_notices.append(notice)
+        self.compose.delete("1.0", "end")
+        self.render_chat()
+        self.render_threads()
+        self.set_status("이미지를 전송하는 중..." if self.attachment else "메시지를 보내는 중...")
         threading.Thread(
             target=self._send_worker,
             args=(self.active_serial, self.active_address, text, self.attachment, notice),
@@ -975,21 +1345,23 @@ class SmsManagerApp:
         else:
             result = self.api(port, "/send", {"to": address, "text": text})
         if notice is not None:
-            notice["label"] = "이미지 전송됨" if result and result.get("direct") else "전송 실패"
+            if attachment:
+                notice["label"] = "이미지 전송됨" if result and result.get("direct") else "전송 실패"
+            else:
+                notice["label"] = "전송됨" if result and result.get("ok") else "전송 실패"
             self.root.after(0, self.render_chat)
             self.root.after(0, self.render_threads)
         if result and result.get("ok"):
-            self.root.after(0, lambda: self.compose.delete("1.0", "end"))
             self.root.after(0, self.clear_attachment)
-            if notice is not None and result.get("direct"):
+            if attachment and result.get("direct"):
                 self.set_status("이미지를 전송했습니다.", hold=30)
-            elif notice is not None:
+            elif attachment:
                 self.set_status(result.get("note", "이미지 전송에 실패했습니다."), hold=15)
             else:
-                self.set_status(result.get("note", "메시지를 발송했습니다."))
-            self._refresh_worker()
-            if notice is not None and result.get("direct"):
-                self.set_status("이미지를 전송했습니다.", hold=30)
+                self.set_status("메시지를 발송했습니다.")
+        elif notice is not None and text and not attachment:
+            self.root.after(0, lambda body=text: self._restore_compose(body))
+            self.set_status("메시지 전송에 실패했습니다. 내용을 입력창에 다시 넣었습니다.", hold=15)
 
     def open_image_composer(self, serial, address, attachment, text):
         suffix = attachment.suffix.lower() if attachment.suffix else ".png"
@@ -1216,11 +1588,31 @@ class SmsManagerApp:
             self.polling = True
             def work():
                 try:
-                    self._refresh_worker()
+                    self._refresh_worker(reload_messages=False)
                 finally:
                     self.polling = False
             threading.Thread(target=work, daemon=True).start()
         self.root.after(5000, self.poll)
+
+    def _restore_compose(self, text):
+        if not self.compose.get("1.0", "end").strip():
+            self.compose.insert("1.0", text)
+            self.compose.focus_set()
+
+    def _notice_confirmed(self, notice):
+        if notice.get("label") in {"전송 중", "전송 실패"}:
+            return False
+        sent_ms = notice["at"] * 1000
+        text = (notice.get("text") or "").strip()
+        for message in self.messages.get(notice["serial"], []):
+            if message.get("incoming") or not same_phone(message.get("address"), notice["address"]):
+                continue
+            if notice.get("image"):
+                if message.get("images") and abs(message["date"] - sent_ms) < 180000:
+                    return True
+            elif text and (message.get("body") or "").strip() == text and message["date"] >= sent_ms - 15000:
+                return True
+        return False
 
     def _shown_as_notice(self, serial, message):
         if message.get("incoming") or not message.get("images"):
@@ -1303,6 +1695,222 @@ class SmsManagerApp:
             os._exit(0)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _unread_entries(self):
+        entries = []
+        for serial in self.devices:
+            seen_map = self.config["seen"].get(serial, {})
+            grouped = defaultdict(list)
+            for message in self.messages.get(serial, []):
+                if message.get("incoming"):
+                    grouped[normalize_phone(message.get("address")) or "알 수 없음"].append(message)
+            for address, items in grouped.items():
+                seen_at = seen_map.get(address, 0)
+                if not seen_at:
+                    seen_at = seen_map.get(items[-1].get("address"), 0)
+                unread_items = [item for item in items if item["date"] > seen_at]
+                if not unread_items:
+                    continue
+                newest = max(unread_items, key=lambda item: item["date"])
+                entries.append({
+                    "serial": serial,
+                    "address": address,
+                    "count": len(unread_items),
+                    "date": newest["date"],
+                    "body": newest.get("body") or ("[이미지]" if newest.get("images") else ""),
+                    "phone": self._phone_name(serial),
+                })
+        entries.sort(key=lambda item: item["date"], reverse=True)
+        return entries
+
+    def _refresh_notice_bar(self):
+        entries = self._unread_entries()
+        total = sum(item["count"] for item in entries)
+        if not total:
+            if self.notice_bar.winfo_ismapped():
+                self.notice_bar.pack_forget()
+            self.root.title(APP_TITLE)
+            return
+        first = entries[0]
+        body = (first["body"] or "[이미지]").replace("\n", " ")[:42]
+        self.notice_label.configure(
+            text=f"새 메시지 {total}건     {first['phone']}  ·  {first['address']}  ·  {body}          클릭하면 그 대화로 이동"
+        )
+        if not self.notice_bar.winfo_ismapped():
+            self.notice_bar.pack(fill="x", pady=(0, 8), before=self.panes)
+        self.root.title(f"{APP_TITLE}  ·  새 메시지 {total}건")
+
+    def _open_newest_unread(self):
+        entries = self._unread_entries()
+        if entries:
+            self._open_arrival(entries[0]["serial"], entries[0]["address"])
+
+    def _announce_arrivals(self, arrivals):
+        self._play_alert_sound()
+        self._flash_taskbar()
+        self._show_arrival_popup(arrivals)
+        self._refresh_notice_bar()
+
+    def _play_alert_sound(self):
+        def work():
+            try:
+                winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                return
+            except Exception:
+                pass
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+            try:
+                winsound.Beep(880, 160)
+                winsound.Beep(1175, 200)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _flash_taskbar(self):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint),
+                    ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint),
+                ]
+
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x3 | 0xC, 8, 0)
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
+
+    def _close_arrival_popup(self):
+        popup = getattr(self, "_arrival_popup", None)
+        self._arrival_popup = None
+        self._arrival_popup_after = None
+        if popup is None:
+            return
+        try:
+            if popup.winfo_exists():
+                popup.destroy()
+        except tk.TclError:
+            pass
+
+    def _show_arrival_popup(self, arrivals):
+        popup = getattr(self, "_arrival_popup", None)
+        exists = False
+        if popup is not None:
+            try:
+                exists = bool(popup.winfo_exists())
+            except tk.TclError:
+                exists = False
+        if not exists:
+            popup = tk.Toplevel(self.root)
+            popup.title("새 메시지 도착")
+            popup.configure(background="#FFF7ED")
+            popup.attributes("-topmost", True)
+            popup.resizable(False, False)
+            popup.protocol("WM_DELETE_WINDOW", self._close_arrival_popup)
+            popup.withdraw()
+            self._arrival_popup = popup
+        for child in popup.winfo_children():
+            child.destroy()
+        header = tk.Frame(popup, background="#C2410C")
+        header.pack(fill="x")
+        tk.Label(
+            header, text=f"새 메시지 {len(arrivals)}건 도착", background="#C2410C", foreground="#FFFFFF",
+            font=("맑은 고딕", 15, "bold"), anchor="w",
+        ).pack(fill="x", padx=16, pady=12)
+        body = tk.Frame(popup, background="#FFF7ED")
+        body.pack(fill="both", padx=14, pady=10)
+        for item in arrivals[:5]:
+            address = item.get("address") or "번호 없음"
+            preview = (item.get("body") or ("[이미지]" if item.get("images") else "(내용 없음)")).replace("\n", " ")
+            if len(preview) > 90:
+                preview = preview[:90] + "…"
+            stamp = datetime.fromtimestamp(item["date"] / 1000).strftime("%H:%M") if item.get("date") else ""
+            row = tk.Frame(body, background="#FFFFFF", highlightthickness=2, highlightbackground="#F97316", cursor="hand2")
+            row.pack(fill="x", pady=4)
+            title = tk.Label(
+                row, text=f"{self._phone_name(item['serial'])}    {address}    {stamp}",
+                background="#FFFFFF", foreground="#9A3412", font=("맑은 고딕", 9, "bold"),
+                anchor="w", cursor="hand2",
+            )
+            title.pack(fill="x", padx=10, pady=(7, 0))
+            text = tk.Label(
+                row, text=preview, background="#FFFFFF", foreground="#1A1A1A",
+                font=("맑은 고딕", 12), anchor="w", justify="left", wraplength=360, cursor="hand2",
+            )
+            text.pack(fill="x", padx=10, pady=(2, 8))
+            serial, target = item["serial"], address
+            for widget in (row, title, text):
+                widget.bind("<Button-1>", lambda _event, s=serial, a=target: self._open_arrival(s, a))
+        extra = len(arrivals) - 5
+        if extra > 0:
+            tk.Label(body, text=f"그 외 {extra}건", background="#FFF7ED", foreground="#9A3412", font=("맑은 고딕", 9)).pack(anchor="w", pady=(2, 0))
+        buttons = tk.Frame(popup, background="#FFF7ED")
+        buttons.pack(fill="x", padx=14, pady=(2, 14))
+        first = arrivals[0]
+        tk.Button(
+            buttons, text="대화 보기",
+            command=lambda s=first["serial"], a=first.get("address") or "": self._open_arrival(s, a),
+            background="#C2410C", foreground="#FFFFFF", activebackground="#9A3412", activeforeground="#FFFFFF",
+            font=("맑은 고딕", 10, "bold"), relief="flat", padx=14, pady=5,
+        ).pack(side="left")
+        tk.Button(
+            buttons, text="닫기", command=self._close_arrival_popup,
+            font=("맑은 고딕", 10), padx=14, pady=5,
+        ).pack(side="right")
+        popup.update_idletasks()
+        width = 430
+        height = max(popup.winfo_reqheight(), 180)
+        popup.geometry(f"{width}x{height}+{popup.winfo_screenwidth() - width - 28}+{popup.winfo_screenheight() - height - 78}")
+        self._show_without_focus(popup)
+        if self._arrival_popup_after:
+            try:
+                popup.after_cancel(self._arrival_popup_after)
+            except tk.TclError:
+                pass
+        self._arrival_popup_after = popup.after(25000, self._close_arrival_popup)
+
+    def _show_without_focus(self, popup):
+        popup.update_idletasks()
+        try:
+            hwnd = ctypes.windll.user32.GetParent(popup.winfo_id()) or popup.winfo_id()
+            popup.attributes("-topmost", True)
+            ctypes.windll.user32.ShowWindow(hwnd, 8)
+        except Exception:
+            popup.deiconify()
+            popup.lift()
+            popup.attributes("-topmost", True)
+
+    def _open_arrival(self, serial, address):
+        self._close_arrival_popup()
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        norm = normalize_phone(address)
+        if serial in self.devices and serial != self.active_serial:
+            if self.device_tree.exists(serial):
+                self.device_tree.selection_set(serial)
+            self.select_device(serial)
+        self.active_address = norm
+        self.thread_search.set("")
+        self.fresh_marks = {mark for mark in self.fresh_marks if not (mark[0] == serial and mark[1] == norm)}
+        self.render_threads()
+        if self.thread_tree.exists(norm):
+            self.thread_tree.selection_set(norm)
+            self.thread_tree.see(norm)
+        else:
+            self.render_chat()
+            self._refresh_notice_bar()
 
     def set_status(self, text, hold=0):
         if hold:
