@@ -106,6 +106,11 @@ class SmsManagerApp:
         self.chat_pages = {}
         self.message_index = {}
         self._index_size = {}
+        self._prefix_max = {}
+        self._session_baselined = set()
+        self._unread_total = {}
+        self._unread_by_address = {}
+        self._full_sync_at = time.time() + 45
         self._paint_token = 0
         self._visible_chat_page = None
         self._save_after = None
@@ -291,19 +296,9 @@ class SmsManagerApp:
             devices[serial] = {"model": model, "port": port, "online": bool(status and status.get("ok"))}
             if devices[serial]["online"] and (reload_messages or serial not in self.messages):
                 messages_loaded = True
-                loaded = self.collect_messages(serial, port)
-                with self.message_lock:
-                    self.messages[serial] = loaded
-                    self._absorb_arrivals(serial, full_snapshot=True)
-                if serial not in self.config["initialized"]:
-                    seen = self.config["seen"].setdefault(serial, {})
-                    for message in self.messages[serial]:
-                        if message.get("incoming"):
-                            seen[normalize_phone(message.get("address"))] = max(
-                                seen.get(normalize_phone(message.get("address")), 0), message["date"]
-                            )
-                    self.config["initialized"].append(serial)
-                    self.save_config()
+                loaded, complete = self.collect_messages(serial, port)
+                self._accept_snapshot(serial, loaded, complete)
+                self._full_sync_at = time.time() + 90
         fingerprint = tuple(
             (serial, device["model"], device["port"], device["online"])
             for serial, device in devices.items()
@@ -314,15 +309,27 @@ class SmsManagerApp:
             self.root.after(0, self.render_all)
         self.set_status(f"연결된 스마트폰 {len(devices)}대")
 
-    def collect_messages(self, serial, port):
+    def collect_messages(self, serial, port, include_archive=True):
         messages = []
         data = self.api(port, "/messages", quiet=True)
-        if data and data.get("ok"):
+        complete = bool(data and data.get("ok"))
+        if complete:
             messages.extend(data["messages"])
-        messages.extend(self.fetch_im_messages(serial))
-        messages.extend(self.fetch_im_files(serial))
+        if include_archive:
+            messages.extend(self.fetch_im_messages(serial))
+            messages.extend(self.fetch_im_files(serial))
         messages.sort(key=lambda item: item.get("date") or 0)
-        return messages
+        return messages, complete
+
+    def _accept_snapshot(self, serial, loaded, complete):
+        if not complete:
+            return False, []
+        with self.message_lock:
+            changed = self._replace_messages(serial, loaded)
+            if serial not in self._session_baselined:
+                self._baseline_history(serial)
+                return changed, []
+            return changed, self._absorb_arrivals(serial, full_snapshot=True)
 
     def fetch_im_messages(self, serial):
         query = "content query --uri content://im/chat --projection _id:address:body:date:type:content_type"
@@ -428,8 +435,8 @@ class SmsManagerApp:
         if self.devices and not self.fast_sync_running:
             self.fast_sync_running = True
             threading.Thread(target=self._fast_sync, daemon=True).start()
-        if self.devices and not self.message_sync_running and time.time() >= getattr(self, "_full_sync_at", 0):
-            self._full_sync_at = time.time() + 30
+        if self.devices and not self.message_sync_running and time.time() >= self._full_sync_at:
+            self._full_sync_at = time.time() + 90
             self.message_sync_running = True
             threading.Thread(target=self._sync_messages, daemon=True).start()
         self.root.after(1000, self.poll_messages)
@@ -441,11 +448,11 @@ class SmsManagerApp:
             for serial, device in list(self.devices.items()):
                 if not device.get("online"):
                     continue
-                messages = self.collect_messages(serial, device["port"])
-                with self.message_lock:
-                    if self._replace_messages(serial, messages):
-                        changed = True
-                    arrivals.extend(self._absorb_arrivals(serial, full_snapshot=True))
+                messages, complete = self.collect_messages(serial, device["port"])
+                changed_now, found = self._accept_snapshot(serial, messages, complete)
+                if changed_now:
+                    changed = True
+                arrivals.extend(found)
             before = len(self.sent_notices)
             self.sent_notices = [notice for notice in self.sent_notices if not self._notice_confirmed(notice)]
             self._schedule_sync_result(changed or len(self.sent_notices) != before, arrivals)
@@ -457,9 +464,8 @@ class SmsManagerApp:
             serials = [serial for serial, device in list(self.devices.items()) if device.get("online")]
             jobs = []
             for serial in serials:
-                existing = self.messages.get(serial, [])
-                jobs.append((serial, "sms", self._recent_since(existing, "sms:")))
-                jobs.append((serial, "im", self._recent_since(existing, "im:")))
+                jobs.append((serial, "sms", self._recent_since(serial, "sms:")))
+                jobs.append((serial, "im", self._recent_since(serial, "im:")))
             if not jobs:
                 return
             from concurrent.futures import ThreadPoolExecutor
@@ -482,19 +488,21 @@ class SmsManagerApp:
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
                 for serial, rows in pool.map(work, jobs):
                     with self.message_lock:
-                        if self._merge_messages(serial, rows):
+                        if serial in self._session_baselined and self._merge_messages(serial, rows):
                             changed = True
-                        arrivals.extend(self._absorb_arrivals(serial, full_snapshot=False))
+                            arrivals.extend(self._absorb_arrivals(serial, full_snapshot=False))
+                        elif self._merge_messages(serial, rows):
+                            changed = True
             before = len(self.sent_notices)
             self.sent_notices = [notice for notice in self.sent_notices if not self._notice_confirmed(notice)]
             self._schedule_sync_result(changed or len(self.sent_notices) != before, arrivals)
         finally:
             self.fast_sync_running = False
 
-    def _recent_since(self, existing, prefix):
-        dates = [item["date"] for item in existing if str(item.get("key", "")).startswith(prefix)]
-        if dates:
-            return max(dates) - 2000
+    def _recent_since(self, serial, prefix):
+        stamp = self._prefix_max.get(serial, {}).get(prefix, 0)
+        if stamp:
+            return stamp - 2000
         return int(time.time() * 1000) - 120000
 
     def _content_rows(self, text):
@@ -565,10 +573,64 @@ class SmsManagerApp:
 
     def _reindex_messages(self, serial):
         grouped = defaultdict(list)
+        prefix_max = {}
         for message in self.messages.get(serial, []):
-            grouped[normalize_phone(message.get("address")) or "알 수 없음"].append(message)
+            norm = message.get("norm") or normalize_phone(message.get("address")) or "알 수 없음"
+            message["norm"] = norm
+            grouped[norm].append(message)
+            key = str(message.get("key") or "")
+            if key.startswith("sms:"):
+                prefix = "sms:"
+            elif key.startswith("im:"):
+                prefix = "im:"
+            else:
+                prefix = ""
+            if prefix:
+                prefix_max[prefix] = max(prefix_max.get(prefix, 0), message.get("date") or 0)
         self.message_index[serial] = grouped
         self._index_size[serial] = len(self.messages.get(serial, []))
+        self._prefix_max[serial] = prefix_max
+        self._recount_unread(serial)
+
+    def _recount_unread(self, serial):
+        if serial not in self._session_baselined:
+            self._unread_total[serial] = 0
+            self._unread_by_address[serial] = {}
+            return
+        seen = self.config["seen"].get(serial, {})
+        counts = {}
+        total = 0
+        for norm, items in self.message_index.get(serial, {}).items():
+            seen_at = seen.get(norm, 0)
+            count = sum(1 for message in items if message.get("incoming") and (message.get("date") or 0) > seen_at)
+            if count:
+                counts[norm] = count
+                total += count
+        self._unread_by_address[serial] = counts
+        self._unread_total[serial] = total
+
+    def _baseline_history(self, serial):
+        if serial in self._session_baselined:
+            return
+        seen = self.config["seen"].setdefault(serial, {})
+        keys = set()
+        for norm, items in self.message_index.get(serial, {}).items():
+            latest = 0
+            for message in items:
+                if not message.get("incoming"):
+                    continue
+                latest = max(latest, message.get("date") or 0)
+                if message.get("key"):
+                    keys.add(message["key"])
+            if latest > seen.get(norm, 0):
+                seen[norm] = latest
+        self.alert_known[serial] = keys
+        self.alert_ready.add(serial)
+        self._session_baselined.add(serial)
+        if serial not in self.config["initialized"]:
+            self.config["initialized"].append(serial)
+        self._recount_unread(serial)
+        self._save_config_soon()
 
     def _thread_messages(self, serial, address):
         total = len(self.messages.get(serial, []))
@@ -582,8 +644,8 @@ class SmsManagerApp:
         if not serial or not address:
             return
         dates = [
-            item["date"] for item in self.messages.get(serial, [])
-            if item.get("incoming") and same_phone(item.get("address"), address)
+            item["date"] for item in self._thread_messages(serial, address)
+            if item.get("incoming")
         ]
         if not dates:
             return
@@ -592,6 +654,7 @@ class SmsManagerApp:
         latest = max(dates)
         if latest > seen.get(norm, 0):
             seen[norm] = latest
+            self._recount_unread(serial)
             self.save_config()
 
     def _absorb_arrivals(self, serial, full_snapshot):
@@ -680,25 +743,12 @@ class SmsManagerApp:
             self.render_all()
 
     def unread_for(self, serial, address=None):
-        seen_map = self.config["seen"].get(serial, {})
-        if address is not None:
-            norm = normalize_phone(address)
-            seen_at = seen_map.get(norm, seen_map.get(address, 0))
-            return sum(
-                1 for message in self._thread_messages(serial, address)
-                if message.get("incoming") and message["date"] > seen_at
-            )
-        count = 0
-        target = normalize_phone(address) if address else None
-        for message in self.messages.get(serial, []):
-            if not message.get("incoming"):
-                continue
-            norm = normalize_phone(message.get("address"))
-            if target is not None and norm != target:
-                continue
-            if message["date"] > seen_map.get(norm, seen_map.get(message.get("address"), 0)):
-                count += 1
-        return count
+        if serial not in self._session_baselined:
+            return 0
+        if address is None:
+            return self._unread_total.get(serial, 0)
+        norm = normalize_phone(address) or "알 수 없음"
+        return self._unread_by_address.get(serial, {}).get(norm, 0)
 
     def render_devices(self):
         selected = self.active_serial
@@ -785,11 +835,9 @@ class SmsManagerApp:
         status = self.ensure_bridge(serial, device["port"])
         device["online"] = bool(status and status.get("ok"))
         if device["online"]:
-            loaded = self.collect_messages(serial, device["port"])
-            with self.message_lock:
-                self.messages[serial] = loaded
-                self._reindex_messages(serial)
-                self._absorb_arrivals(serial, full_snapshot=True)
+            loaded, complete = self.collect_messages(serial, device["port"])
+            self._accept_snapshot(serial, loaded, complete)
+            self._full_sync_at = time.time() + 90
             self.root.after(0, self.render_all)
             self.set_status(f"{device['model']} 연결됨")
         else:
@@ -798,21 +846,20 @@ class SmsManagerApp:
     def render_threads(self):
         selected = self.active_address
         query = self.thread_search.get().strip().lower()
-        groups = defaultdict(list)
-        seen_map = self.config["seen"].get(self.active_serial, {})
-        unread_counts = defaultdict(int)
-        for message in self.messages.get(self.active_serial, []):
-            norm = normalize_phone(message.get("address")) or "알 수 없음"
-            groups[norm].append(message)
-            if not message.get("incoming"):
-                continue
-            seen_at = seen_map.get(norm, seen_map.get(message.get("address"), 0))
-            if message["date"] > seen_at:
-                unread_counts[norm] += 1
+        serial = self.active_serial
+        if self._index_size.get(serial) != len(self.messages.get(serial, [])):
+            self._reindex_messages(serial)
+        groups = self.message_index.get(serial, {})
+        unread_counts = self._unread_by_address.get(serial, {}) if serial in self._session_baselined else {}
         selected_norm = normalize_phone(selected) if selected else ""
+        pending_preview = {}
+        for notice in self.sent_notices:
+            if notice.get("serial") != serial or self._notice_confirmed(notice):
+                continue
+            pending_preview[normalize_phone(notice.get("address"))] = notice.get("text") or notice.get("label") or ""
         ranked = sorted(
             groups.items(),
-            key=lambda item: (0 if unread_counts[item[0]] else 1, -item[1][-1]["date"]),
+            key=lambda item: (0 if unread_counts.get(item[0]) else 1, -(item[1][-1]["date"] if item[1] else 0)),
         )
         rows = []
         for address, items in ranked:
@@ -821,14 +868,8 @@ class SmsManagerApp:
                 if query not in searchable.lower():
                     continue
             latest = items[-1]
-            preview = latest.get("body") or ("[이미지]" if latest.get("images") else "")
-            pending = [
-                notice for notice in self.sent_notices
-                if same_phone(notice["address"], address) and not self._notice_confirmed(notice)
-            ]
-            if pending:
-                preview = pending[-1].get("text") or pending[-1].get("label") or preview
-            unread = unread_counts[address]
+            preview = pending_preview.get(address) or latest.get("body") or ("[이미지]" if latest.get("images") else "")
+            unread = unread_counts.get(address, 0)
             preview_text = preview.replace("\n", " ")
             if unread:
                 label = f"● {address}    새 {unread}건"
@@ -896,6 +937,7 @@ class SmsManagerApp:
                 latest = max(item["date"] for item in items)
                 if latest > seen.get(norm, 0):
                     seen[norm] = latest
+                    self._recount_unread(serial)
                     self._save_config_soon()
             self.fresh_marks = {mark for mark in self.fresh_marks if not (mark[0] == serial and mark[1] == norm)}
             self._mark_thread_row_read(norm)
@@ -1826,8 +1868,8 @@ class SmsManagerApp:
             return False
         sent_ms = notice["at"] * 1000
         text = (notice.get("text") or "").strip()
-        for message in self.messages.get(notice["serial"], []):
-            if message.get("incoming") or not same_phone(message.get("address"), notice["address"]):
+        for message in self._thread_messages(notice["serial"], notice.get("address")):
+            if message.get("incoming"):
                 continue
             if notice.get("image"):
                 if message.get("images") and abs(message["date"] - sent_ms) < 180000:
@@ -1849,10 +1891,8 @@ class SmsManagerApp:
 
     def _notice_pending(self, notice):
         sent_ms = notice["at"] * 1000
-        for message in self.messages.get(notice["serial"], []):
+        for message in self._thread_messages(notice["serial"], notice.get("address")):
             if message.get("incoming") or not message.get("images"):
-                continue
-            if not same_phone(message.get("address"), notice["address"]):
                 continue
             if message["date"] >= sent_ms - 20000:
                 return False
