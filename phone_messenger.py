@@ -103,6 +103,12 @@ class SmsManagerApp:
         self._render_queued = False
         self._render_dirty = False
         self.chat_limit = {}
+        self.chat_pages = {}
+        self.message_index = {}
+        self._index_size = {}
+        self._paint_token = 0
+        self._visible_chat_page = None
+        self._save_after = None
         self.status = tk.StringVar(value="휴대폰을 검색하는 중...")
         self.chat_title = tk.StringVar(value="대화를 선택하세요")
         self.attachment_text = tk.StringVar(value="첨부 이미지 없음")
@@ -540,6 +546,7 @@ class SmsManagerApp:
             return False
         current.extend(added)
         current.sort(key=lambda item: item.get("date") or 0)
+        self._reindex_messages(serial)
         return True
 
     def _replace_messages(self, serial, messages):
@@ -553,7 +560,22 @@ class SmsManagerApp:
         merged.sort(key=lambda item: item.get("date") or 0)
         old_keys = [item.get("key") for item in self.messages.get(serial, [])]
         self.messages[serial] = merged
+        self._reindex_messages(serial)
         return old_keys != [item.get("key") for item in merged]
+
+    def _reindex_messages(self, serial):
+        grouped = defaultdict(list)
+        for message in self.messages.get(serial, []):
+            grouped[normalize_phone(message.get("address")) or "알 수 없음"].append(message)
+        self.message_index[serial] = grouped
+        self._index_size[serial] = len(self.messages.get(serial, []))
+
+    def _thread_messages(self, serial, address):
+        total = len(self.messages.get(serial, []))
+        if self._index_size.get(serial) != total:
+            self._reindex_messages(serial)
+        norm = normalize_phone(address) or "알 수 없음"
+        return self.message_index.get(serial, {}).get(norm, [])
 
     def _mark_open_thread_seen(self):
         serial, address = self.active_serial, self.active_address
@@ -659,6 +681,13 @@ class SmsManagerApp:
 
     def unread_for(self, serial, address=None):
         seen_map = self.config["seen"].get(serial, {})
+        if address is not None:
+            norm = normalize_phone(address)
+            seen_at = seen_map.get(norm, seen_map.get(address, 0))
+            return sum(
+                1 for message in self._thread_messages(serial, address)
+                if message.get("incoming") and message["date"] > seen_at
+            )
         count = 0
         target = normalize_phone(address) if address else None
         for message in self.messages.get(serial, []):
@@ -759,6 +788,7 @@ class SmsManagerApp:
             loaded = self.collect_messages(serial, device["port"])
             with self.message_lock:
                 self.messages[serial] = loaded
+                self._reindex_messages(serial)
                 self._absorb_arrivals(serial, full_snapshot=True)
             self.root.after(0, self.render_all)
             self.set_status(f"{device['model']} 연결됨")
@@ -858,16 +888,42 @@ class SmsManagerApp:
         self._opening_thread = True
         try:
             self.active_address = selected[0]
-            items = [m for m in self.messages.get(self.active_serial, []) if same_phone(m.get("address"), self.active_address)]
-            if items:
-                self.config["seen"].setdefault(self.active_serial, {})[normalize_phone(self.active_address)] = max(m["date"] for m in items)
-                self.save_config()
+            serial = self.active_serial
             norm = normalize_phone(self.active_address)
-            self.fresh_marks = {mark for mark in self.fresh_marks if not (mark[0] == self.active_serial and mark[1] == norm)}
-            self.update_unread_labels()
+            items = self._thread_messages(serial, self.active_address)
+            if items:
+                seen = self.config["seen"].setdefault(serial, {})
+                latest = max(item["date"] for item in items)
+                if latest > seen.get(norm, 0):
+                    seen[norm] = latest
+                    self._save_config_soon()
+            self.fresh_marks = {mark for mark in self.fresh_marks if not (mark[0] == serial and mark[1] == norm)}
+            self._mark_thread_row_read(norm)
             self.render_chat()
         finally:
             self._opening_thread = False
+
+    def _save_config_soon(self):
+        if self._save_after:
+            return
+        self._save_after = self.root.after(400, self._flush_config_save)
+
+    def _flush_config_save(self):
+        self._save_after = None
+        self.save_config()
+
+    def _mark_thread_row_read(self, address):
+        if not self.thread_tree.exists(address):
+            return
+        values = list(self.thread_tree.item(address, "values"))
+        if len(values) < 3:
+            return
+        preview = str(values[2])
+        if preview.startswith("새 메시지"):
+            preview = preview.replace("새 메시지  ", "", 1).strip()
+        values[1] = address
+        values[2] = preview[:35]
+        self.thread_tree.item(address, values=values, tags=("read",))
 
     def on_thread_shortcut(self, event):
         if self.thread_tree.identify_column(event.x) != "#1":
@@ -1000,12 +1056,15 @@ class SmsManagerApp:
             widget = getattr(widget, "master", None)
 
     def clear_chat(self):
+        self._paint_token += 1
         self.chat_title.set("대화를 선택하세요")
         self._rendered_address = None
         self._chat_signature = None
-        for child in self.chat_inner.winfo_children():
-            child.destroy()
-        self.image_refs.clear()
+        self._visible_chat_page = None
+        for page in self.chat_pages.values():
+            page["frame"].destroy()
+        self.chat_pages.clear()
+        self.image_refs = []
 
     def render_chat(self):
         serial, address = self.active_serial, self.active_address
@@ -1016,7 +1075,10 @@ class SmsManagerApp:
         if unread:
             title = f"● 새 메시지 {unread}건  ·  {title}"
         self.chat_title.set(title)
-        items = [m for m in self.messages.get(serial, []) if same_phone(m.get("address"), address) and not self._shown_as_notice(serial, m)]
+        items = [
+            message for message in self._thread_messages(serial, address)
+            if not self._shown_as_notice(serial, message)
+        ]
         for notice in self.sent_notices:
             if notice["serial"] != serial or not same_phone(notice["address"], address) or self._notice_confirmed(notice):
                 continue
@@ -1031,56 +1093,135 @@ class SmsManagerApp:
             })
         items.sort(key=lambda item: item["date"])
         thread_key = (serial, normalize_phone(address))
-        limit = self.chat_limit.get(thread_key, 120)
+        limit = self.chat_limit.get(thread_key, 80)
         hidden = max(0, len(items) - limit)
         shown = items[-limit:]
         signature = (thread_key, hidden, tuple(self._chat_item_token(serial, item) for item in shown))
-        if signature == getattr(self, "_chat_signature", None):
-            return
-        self._chat_signature = signature
-        same_thread = getattr(self, "_rendered_address", None) == thread_key
-        view = self.chat_canvas.yview() if same_thread else (0.0, 1.0)
+        cached = self.chat_pages.get(thread_key)
         anchor = getattr(self, "_chat_anchor", "stick")
         self._chat_anchor = "stick"
-        stick = anchor != "top" and ((not same_thread) or view[1] >= 0.985)
+        if cached and cached["signature"] == signature:
+            self._chat_signature = signature
+            self._rendered_address = thread_key
+            show_anchor = "keep" if anchor == "stick" and cached is not self._visible_chat_page else anchor
+            self._show_chat_page(cached, show_anchor)
+            return
+        if cached:
+            if self._visible_chat_page is cached:
+                self._visible_chat_page = None
+            cached["frame"].destroy()
+        self._paint_token += 1
+        token = self._paint_token
+        frame = tk.Frame(self.chat_inner, background=CHAT_BG)
+        page = {
+            "frame": frame,
+            "signature": signature,
+            "images": [],
+            "token": token,
+            "view": (0.0, 1.0),
+        }
+        self.chat_pages[thread_key] = page
+        self._remember_chat_page(thread_key)
+        self._chat_signature = signature
         self._rendered_address = thread_key
-        for child in self.chat_inner.winfo_children():
-            child.destroy()
-        self.image_refs.clear()
+        self._show_chat_page(page, "top" if anchor == "top" else "stick")
         if hidden:
             tk.Button(
-                self.chat_inner, text=f"이전 메시지 {hidden}건 보기",
+                frame, text=f"이전 메시지 {hidden}건 보기",
                 command=self._show_older_messages, relief="flat",
                 background="#D5DEE8", activebackground="#C5D0DC",
                 font=("맑은 고딕", 9), padx=10, pady=4,
             ).pack(pady=(8, 2))
         if not shown:
             tk.Label(
-                self.chat_inner, text="이 번호와 주고받은 문자가 없습니다.",
+                frame, text="이 번호와 주고받은 문자가 없습니다.",
                 background=CHAT_BG, foreground=META_IN, font=("맑은 고딕", 11),
             ).pack(pady=24)
-        last_day = None
+            return
         width = max(self.chat_canvas.winfo_width(), 420)
         wrap = max(220, min(360, int(width * 0.62)))
-        for message in shown:
-            stamp = datetime.fromtimestamp(message["date"] / 1000)
-            day = stamp.strftime("%Y년 %m월 %d일")
-            if day != last_day:
-                last_day = day
-                tk.Label(
-                    self.chat_inner, text=day, background="#D5DEE8", foreground="#243140",
-                    font=("맑은 고딕", 8), padx=10, pady=3,
-                ).pack(pady=(12, 4))
-            self._add_message_bubble(message, serial, stamp.strftime("%H:%M"), wrap)
-        self._prefetch_recent_images(serial, shown)
+        self.root.after(
+            1, lambda: self._paint_chat_slice(token, thread_key, shown, 0, None, wrap, serial, anchor)
+        )
+
+    def _remember_chat_page(self, thread_key):
+        order = [
+            key for key in getattr(self, "_chat_page_order", [])
+            if key != thread_key and key in self.chat_pages
+        ]
+        order.append(thread_key)
+        self._chat_page_order = order
+        while len(order) > 4:
+            old = order.pop(0)
+            page = self.chat_pages.get(old)
+            if page and page is self._visible_chat_page:
+                order.append(old)
+                if order[0] == old:
+                    break
+                continue
+            self.chat_pages.pop(old, None)
+            if page:
+                page["token"] = None
+                try:
+                    page["frame"].destroy()
+                except tk.TclError:
+                    pass
+
+    def _show_chat_page(self, page, anchor):
+        current = self._visible_chat_page
+        if current is not None and current is not page:
+            try:
+                current["view"] = self.chat_canvas.yview()
+                current["frame"].pack_forget()
+            except tk.TclError:
+                pass
+        if not page["frame"].winfo_ismapped():
+            page["frame"].pack(fill="x")
+        self._visible_chat_page = page
+        self.image_refs = page["images"]
         self.chat_inner.update_idletasks()
         self._sync_chat_scroll()
         if anchor == "top":
             self.chat_canvas.yview_moveto(0)
-        elif stick:
-            self.chat_canvas.yview_moveto(1)
+        elif anchor == "keep" and page.get("view"):
+            self.chat_canvas.yview_moveto(page["view"][0])
         else:
-            self.chat_canvas.yview_moveto(view[0])
+            self.chat_canvas.yview_moveto(1)
+
+    def _paint_chat_slice(self, token, thread_key, shown, index, last_day, wrap, serial, anchor):
+        page = self.chat_pages.get(thread_key)
+        if not page or page.get("token") != token:
+            return
+        frame = page["frame"]
+        end = min(index + 10, len(shown))
+        for message in shown[index:end]:
+            stamp = datetime.fromtimestamp((message.get("date") or 0) / 1000)
+            day = stamp.strftime("%Y년 %m월 %d일")
+            if day != last_day:
+                last_day = day
+                tk.Label(
+                    frame, text=day, background="#D5DEE8", foreground="#243140",
+                    font=("맑은 고딕", 8), padx=10, pady=3,
+                ).pack(pady=(12, 4))
+            self._add_message_bubble(
+                message, serial, stamp.strftime("%H:%M"), wrap, frame, page["images"]
+            )
+        visible = self._visible_chat_page is page
+        if visible:
+            self.chat_inner.update_idletasks()
+            self._sync_chat_scroll()
+            if anchor == "top":
+                self.chat_canvas.yview_moveto(0)
+            elif index == 0 or anchor != "keep":
+                self.chat_canvas.yview_moveto(1)
+        if end < len(shown):
+            self.root.after(
+                1, lambda i=end, day=last_day: self._paint_chat_slice(
+                    token, thread_key, shown, i, day, wrap, serial, anchor
+                )
+            )
+            return
+        self._prefetch_recent_images(serial, shown)
 
     def _chat_item_token(self, serial, message):
         images = tuple(
@@ -1101,12 +1242,12 @@ class SmsManagerApp:
         if not serial or not address:
             return
         key = (serial, normalize_phone(address))
-        self.chat_limit[key] = self.chat_limit.get(key, 120) + 120
+        self.chat_limit[key] = self.chat_limit.get(key, 80) + 80
         self._chat_signature = None
         self._chat_anchor = "top"
         self.render_chat()
 
-    def _add_message_bubble(self, message, serial, clock, wrap):
+    def _add_message_bubble(self, message, serial, clock, wrap, parent=None, image_store=None):
         incoming = bool(message.get("incoming"))
         failed = message.get("sent_label") == "전송 실패"
         fresh = incoming and (
@@ -1117,7 +1258,7 @@ class SmsManagerApp:
         hint_color = "#9A3412" if fresh else ("#5C6B7A" if incoming else "#D6E4FF")
         who = "새 메시지 · 받음" if fresh else ("상대 · 받음" if incoming else "나 · 보냄")
         who_color = "#C2410C" if fresh else (META_IN if incoming else META_OUT)
-        row = tk.Frame(self.chat_inner, background=CHAT_BG)
+        row = tk.Frame(parent or self.chat_inner, background=CHAT_BG)
         row.pack(fill="x", padx=12, pady=3)
         holder = tk.Frame(row, background=CHAT_BG)
         holder.pack(side="left" if incoming else "right", anchor="w" if incoming else "e")
@@ -1160,7 +1301,7 @@ class SmsManagerApp:
                 pending = tk.Label(bubble, text="이미지 불러오는 중", background=bubble_bg, foreground=hint_color, font=("맑은 고딕", 9))
                 pending.pack(anchor="w", pady=(4, 0))
                 continue
-            self._add_bubble_image(bubble, raw, filename, bubble_bg)
+            self._add_bubble_image(bubble, raw, filename, bubble_bg, image_store)
             hint = tk.Label(bubble, text="클릭하면 크게 보기", background=bubble_bg, foreground=hint_color, font=("맑은 고딕", 8))
             hint.pack(anchor="w")
         status = message.get("sent_label")
@@ -1175,7 +1316,7 @@ class SmsManagerApp:
         widget.bind("<Control-c>", copy)
         widget.bind("<Control-C>", copy)
 
-    def _add_bubble_image(self, parent, raw, filename, background):
+    def _add_bubble_image(self, parent, raw, filename, background, image_store=None):
         try:
             thumb = Image.open(io.BytesIO(raw)).copy()
             thumb.thumbnail((150, 110))
@@ -1186,7 +1327,8 @@ class SmsManagerApp:
         label = tk.Label(parent, image=photo, background=background, cursor="hand2", bd=0)
         label.bind("<Button-1>", lambda _e, data=raw, name=filename: self.open_image_viewer(data, name))
         label.pack(anchor="w", pady=(4, 0))
-        self.image_refs.append(photo)
+        store = self.image_refs if image_store is None else image_store
+        store.append(photo)
 
     def _prefetch_recent_images(self, serial, items):
         needed = []
