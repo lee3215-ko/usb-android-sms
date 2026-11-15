@@ -100,6 +100,9 @@ class SmsManagerApp:
         self.polling = False
         self.suppress_selection = False
         self._suppress_token = 0
+        self._render_queued = False
+        self._render_dirty = False
+        self.chat_limit = {}
         self.status = tk.StringVar(value="휴대폰을 검색하는 중...")
         self.chat_title = tk.StringVar(value="대화를 선택하세요")
         self.attachment_text = tk.StringVar(value="첨부 이미지 없음")
@@ -275,11 +278,13 @@ class SmsManagerApp:
             if len(p) >= 2 and p[1] == "device":
                 found.append((p[0], next((x.split(":", 1)[1] for x in p if x.startswith("model:")), p[0])))
         devices = {}
+        messages_loaded = False
         for i, (serial, model) in enumerate(found):
             port = 18765 + i
             status = self.ensure_bridge(serial, port)
             devices[serial] = {"model": model, "port": port, "online": bool(status and status.get("ok"))}
             if devices[serial]["online"] and (reload_messages or serial not in self.messages):
+                messages_loaded = True
                 loaded = self.collect_messages(serial, port)
                 with self.message_lock:
                     self.messages[serial] = loaded
@@ -293,8 +298,14 @@ class SmsManagerApp:
                             )
                     self.config["initialized"].append(serial)
                     self.save_config()
+        fingerprint = tuple(
+            (serial, device["model"], device["port"], device["online"])
+            for serial, device in devices.items()
+        )
         self.devices = devices
-        self.root.after(0, self.render_all)
+        if messages_loaded or fingerprint != getattr(self, "_device_fingerprint", None):
+            self._device_fingerprint = fingerprint
+            self.root.after(0, self.render_all)
         self.set_status(f"연결된 스마트폰 {len(devices)}대")
 
     def collect_messages(self, serial, port):
@@ -628,12 +639,23 @@ class SmsManagerApp:
         return self.config["names"].get(serial, device.get("model") or serial)
 
     def render_all(self):
+        self._render_dirty = True
+        if self._render_queued:
+            return
+        self._render_queued = True
+        self.root.after(40, self._flush_render)
+
+    def _flush_render(self):
+        self._render_queued = False
+        self._render_dirty = False
         self.render_devices()
         if self.active_serial in self.devices:
             self.render_threads()
             if self.active_address:
                 self.render_chat()
         self._refresh_notice_bar()
+        if self._render_dirty:
+            self.render_all()
 
     def unread_for(self, serial, address=None):
         seen_map = self.config["seen"].get(serial, {})
@@ -651,21 +673,28 @@ class SmsManagerApp:
 
     def render_devices(self):
         selected = self.active_serial
-        self.suppress_selection = True
-        self._suppress_token += 1
-        token = self._suppress_token
-        self.device_tree.delete(*self.device_tree.get_children())
-        self.device_rows.clear()
-        for serial, d in self.devices.items():
-            name = self.config["names"].get(serial, d["model"])
+        rows = []
+        for serial, device in self.devices.items():
+            name = self.config["names"].get(serial, device["model"])
             unread = self.unread_for(serial)
-            state = "연결됨" if d["online"] else "브리지 실행 필요"
+            state = "연결됨" if device["online"] else "브리지 실행 필요"
             if unread:
                 label = f"● {name}    새 메시지 {unread}건"
                 tags = ("unread",)
             else:
                 label = name
                 tags = ("read",)
+            rows.append((serial, label, state, tags))
+        signature = (selected, tuple(rows))
+        if signature == getattr(self, "_device_signature", None):
+            return
+        self._device_signature = signature
+        self.suppress_selection = True
+        self._suppress_token += 1
+        token = self._suppress_token
+        self.device_tree.delete(*self.device_tree.get_children())
+        self.device_rows.clear()
+        for serial, label, state, tags in rows:
             self.device_rows[serial] = self.device_tree.insert(
                 "", "end", iid=serial, text=label, values=(state,), tags=tags)
         if selected in self.devices:
@@ -739,10 +768,6 @@ class SmsManagerApp:
     def render_threads(self):
         selected = self.active_address
         query = self.thread_search.get().strip().lower()
-        self.suppress_selection = True
-        self._suppress_token += 1
-        token = self._suppress_token
-        self.thread_tree.delete(*self.thread_tree.get_children())
         groups = defaultdict(list)
         seen_map = self.config["seen"].get(self.active_serial, {})
         unread_counts = defaultdict(int)
@@ -759,10 +784,12 @@ class SmsManagerApp:
             groups.items(),
             key=lambda item: (0 if unread_counts[item[0]] else 1, -item[1][-1]["date"]),
         )
+        rows = []
         for address, items in ranked:
-            searchable = address + "\n" + "\n".join((item.get("body") or "") for item in items)
-            if query and query not in searchable.lower():
-                continue
+            if query:
+                searchable = address + "\n" + "\n".join((item.get("body") or "") for item in items)
+                if query not in searchable.lower():
+                    continue
             latest = items[-1]
             preview = latest.get("body") or ("[이미지]" if latest.get("images") else "")
             pending = [
@@ -781,9 +808,19 @@ class SmsManagerApp:
                 label = address
                 preview_text = preview_text[:35]
                 tags = ("read",)
-            self.thread_tree.insert("", "end", iid=address, values=("열기", label, preview_text), tags=tags)
+            rows.append((address, label, preview_text, tags))
         if selected_norm and selected_norm not in groups and (not query or query in selected_norm.lower()):
-            self.thread_tree.insert("", 0, iid=selected_norm, values=("열기", selected_norm, "[새 메시지]"))
+            rows.insert(0, (selected_norm, selected_norm, "[새 메시지]", ("read",)))
+        signature = (self.active_serial, selected_norm, tuple(rows))
+        if signature == getattr(self, "_thread_signature", None):
+            return
+        self._thread_signature = signature
+        self.suppress_selection = True
+        self._suppress_token += 1
+        token = self._suppress_token
+        self.thread_tree.delete(*self.thread_tree.get_children())
+        for address, label, preview_text, tags in rows:
+            self.thread_tree.insert("", "end", iid=address, values=("열기", label, preview_text), tags=tags)
         if selected_norm and self.thread_tree.exists(selected_norm):
             self.thread_tree.selection_set(selected_norm)
         self.root.after_idle(lambda token=token: self._release_selection_suppress(token))
@@ -965,6 +1002,7 @@ class SmsManagerApp:
     def clear_chat(self):
         self.chat_title.set("대화를 선택하세요")
         self._rendered_address = None
+        self._chat_signature = None
         for child in self.chat_inner.winfo_children():
             child.destroy()
         self.image_refs.clear()
@@ -993,14 +1031,30 @@ class SmsManagerApp:
             })
         items.sort(key=lambda item: item["date"])
         thread_key = (serial, normalize_phone(address))
+        limit = self.chat_limit.get(thread_key, 120)
+        hidden = max(0, len(items) - limit)
+        shown = items[-limit:]
+        signature = (thread_key, hidden, tuple(self._chat_item_token(serial, item) for item in shown))
+        if signature == getattr(self, "_chat_signature", None):
+            return
+        self._chat_signature = signature
         same_thread = getattr(self, "_rendered_address", None) == thread_key
         view = self.chat_canvas.yview() if same_thread else (0.0, 1.0)
-        stick = (not same_thread) or view[1] >= 0.985
+        anchor = getattr(self, "_chat_anchor", "stick")
+        self._chat_anchor = "stick"
+        stick = anchor != "top" and ((not same_thread) or view[1] >= 0.985)
         self._rendered_address = thread_key
         for child in self.chat_inner.winfo_children():
             child.destroy()
         self.image_refs.clear()
-        if not items:
+        if hidden:
+            tk.Button(
+                self.chat_inner, text=f"이전 메시지 {hidden}건 보기",
+                command=self._show_older_messages, relief="flat",
+                background="#D5DEE8", activebackground="#C5D0DC",
+                font=("맑은 고딕", 9), padx=10, pady=4,
+            ).pack(pady=(8, 2))
+        if not shown:
             tk.Label(
                 self.chat_inner, text="이 번호와 주고받은 문자가 없습니다.",
                 background=CHAT_BG, foreground=META_IN, font=("맑은 고딕", 11),
@@ -1008,7 +1062,7 @@ class SmsManagerApp:
         last_day = None
         width = max(self.chat_canvas.winfo_width(), 420)
         wrap = max(220, min(360, int(width * 0.62)))
-        for message in items:
+        for message in shown:
             stamp = datetime.fromtimestamp(message["date"] / 1000)
             day = stamp.strftime("%Y년 %m월 %d일")
             if day != last_day:
@@ -1018,13 +1072,39 @@ class SmsManagerApp:
                     font=("맑은 고딕", 8), padx=10, pady=3,
                 ).pack(pady=(12, 4))
             self._add_message_bubble(message, serial, stamp.strftime("%H:%M"), wrap)
-        self._prefetch_recent_images(serial, items)
+        self._prefetch_recent_images(serial, shown)
         self.chat_inner.update_idletasks()
         self._sync_chat_scroll()
-        if stick:
+        if anchor == "top":
+            self.chat_canvas.yview_moveto(0)
+        elif stick:
             self.chat_canvas.yview_moveto(1)
         else:
             self.chat_canvas.yview_moveto(view[0])
+
+    def _chat_item_token(self, serial, message):
+        images = tuple(
+            (str(image.get("id")), (serial, str(image.get("id"))) in self.media_cache)
+            for image in (message.get("images") or [])
+        )
+        fresh = (
+            serial, normalize_phone(message.get("address")), message.get("key")
+        ) in self.fresh_marks
+        return (
+            message.get("key"), message.get("date"), bool(message.get("incoming")),
+            message.get("body") or "", message.get("sent_label") or "",
+            str(message.get("local_image") or ""), fresh, images,
+        )
+
+    def _show_older_messages(self):
+        serial, address = self.active_serial, self.active_address
+        if not serial or not address:
+            return
+        key = (serial, normalize_phone(address))
+        self.chat_limit[key] = self.chat_limit.get(key, 120) + 120
+        self._chat_signature = None
+        self._chat_anchor = "top"
+        self.render_chat()
 
     def _add_message_bubble(self, message, serial, clock, wrap):
         incoming = bool(message.get("incoming"))

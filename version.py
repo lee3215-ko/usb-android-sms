@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPOSITORY = "lee3215-ko/usb-android-sms"
 ASSET_NAME = "UsbSms-Windows-x64.zip"
 PACKAGE_NAME = "UsbSms"
